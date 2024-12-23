@@ -2,10 +2,14 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 if __name__ == "__main__":
     from argparse import ArgumentParser
     from pytorch_lightning import Trainer
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
+    import pytorch_lightning as pl
 
     rank_zero_info("########## work in progress ##########")
 
@@ -81,6 +85,9 @@ if __name__ == "__main__":
     parser.add_argument("--beta2", default=0.99, type=float)  # use 0.999 when your model is close to convergence
     parser.add_argument("--adam_eps", default=1e-8, type=float)
     parser.add_argument("--grad_cp", default=0, type=int)  # gradient checkpt: saves VRAM, but slower
+    parser.add_argument("--dropout", default=0, type=float) # try 0.01 / 0.02 / 0.05 / 0.1
+    parser.add_argument("--weight_decay", default=0, type=float) # try 0.1 / 0.01 / 0.001
+    parser.add_argument("--weight_decay_final", default=-1, type=float)
 
     parser.add_argument("--my_pile_version", default=1, type=int)  # my special pile version
     parser.add_argument("--my_pile_stage", default=0, type=int)  # my special pile mode
@@ -101,6 +108,8 @@ if __name__ == "__main__":
     parser.add_argument("--my_sample_len", default=0, type=int)
     parser.add_argument("--my_ffn_shift", default=1, type=int)
     parser.add_argument("--my_att_shift", default=1, type=int)
+    parser.add_argument("--head_size_a", default=64, type=int) # can try larger values for larger models
+    parser.add_argument("--head_size_divisor", default=8, type=int)
     parser.add_argument("--my_pos_emb", default=0, type=int)
     parser.add_argument("--load_partial", default=0, type=int)
     parser.add_argument("--magic_prime", default=0, type=int)
@@ -108,19 +117,27 @@ if __name__ == "__main__":
     parser.add_argument("--my_random_steps", default=0, type=int)
     parser.add_argument("--my_testing", default='', type=str)
     parser.add_argument("--my_exit", default=99999999, type=int)
+    parser.add_argument("--my_exit_tokens", default=0, type=int)
 
-    parser = Trainer.add_argparse_args(parser)
+    if pl.__version__[0]=='2':
+        parser.add_argument("--accelerator", default="gpu", type=str)
+        parser.add_argument("--strategy", default="auto", type=str)
+        parser.add_argument("--devices", default=1, type=int)
+        parser.add_argument("--num_nodes", default=1, type=int)
+        parser.add_argument("--precision", default="fp16", type=str)
+        parser.add_argument("--accumulate_grad_batches", default=1, type=int)
+    else:
+        parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
     ########################################################################################################
 
-    import os, warnings, math, datetime, sys, time, importlib
+    import os, warnings, math, datetime, sys, time
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
     if "deepspeed" in args.strategy:
         import deepspeed
-    import pytorch_lightning as pl
     from pytorch_lightning import seed_everything
 
     if args.random_seed >= 0:
@@ -145,10 +162,14 @@ if __name__ == "__main__":
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     os.environ["RWKV_T_MAX"] = str(args.ctx_len)
     os.environ["RWKV_MY_TESTING"] = args.my_testing
+    os.environ["RWKV_HEAD_SIZE_A"] = str(args.head_size_a)
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:
-        args.dim_ffn = args.n_embd * 4
+        if 'r3' in args.my_testing:
+            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)
+        else:
+            args.dim_ffn = args.n_embd * 4
 
     if args.data_type == "wds_img":
         args.run_name = f"v{args.my_img_version}-{args.my_img_size}-{args.my_img_bit}bit-{args.my_img_clip}x{args.my_img_clip_scale}"
@@ -186,12 +207,15 @@ if __name__ == "__main__":
 
         if magic_prime_bak > 0:
             args.magic_prime = magic_prime_bak
-        args.epoch_count = args.magic_prime // 40320
+        if args.my_qa_mask == 2:
+            args.epoch_count = 2 * args.magic_prime // 40320
+        else:
+            args.epoch_count = args.magic_prime // 40320
 
         args.epoch_steps = 40320 // args.real_bsz
         assert args.epoch_steps * args.real_bsz == 40320
-        if args.my_pile_stage == 2:
-            assert args.lr_final == args.lr_init
+        # if args.my_pile_stage == 2:
+        #     assert args.lr_final == args.lr_init
         if args.my_pile_stage >= 2:  # find latest saved model
             list_p = []
             for p in os.listdir(args.proj_dir):
@@ -220,6 +244,11 @@ if __name__ == "__main__":
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
+    try:
+        deepspeed_version = deepspeed.__version__
+    except:
+        deepspeed_version = None
+        pass
     rank_zero_info(
         f"""
 ############################################################################
@@ -237,8 +266,8 @@ if __name__ == "__main__":
 # Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, beta {args.betas}, eps {args.adam_eps}
 #
 # Found torch {torch.__version__}, recommend 1.13.1+cu117 or newer
-# Found deepspeed {deepspeed.__version__ if importlib.util.find_spec('deepspeed') else 'None'}, recommend 0.7.0 (faster than newer versions)
-# Found pytorch_lightning {pl.__version__}, recommend 1.9.1 or newer
+# Found deepspeed {deepspeed_version}, recommend 0.7.0 (faster than newer versions)
+# Found pytorch_lightning {pl.__version__}, recommend 1.9.5
 #
 ############################################################################
 """
@@ -301,6 +330,11 @@ if __name__ == "__main__":
     rank_zero_info(f"########## Loading {args.load_model}... ##########")
     try:
         load_dict = torch.load(args.load_model, map_location="cpu")
+        load_keys = list(load_dict.keys())
+        for k in load_keys:
+            if k.startswith('_forward_module.'):
+                load_dict[k.replace('_forward_module.','')] = load_dict[k]
+                del load_dict[k]
     except:
         rank_zero_info(f"Bad checkpoint {args.load_model}")
         if args.my_pile_stage >= 2:  # try again using another checkpoint
@@ -320,10 +354,15 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
-    trainer = Trainer.from_argparse_args(
-        args,
-        callbacks=[train_callback(args)],
-    )
+    if pl.__version__[0]=='2':
+        trainer = Trainer(accelerator=args.accelerator,strategy=args.strategy,devices=args.devices,num_nodes=args.num_nodes,precision=args.precision,
+        logger=args.logger,callbacks=[train_callback(args)],max_epochs=args.max_epochs,check_val_every_n_epoch=args.check_val_every_n_epoch,num_sanity_val_steps=args.num_sanity_val_steps,
+        log_every_n_steps=args.log_every_n_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val)
+    else:
+        trainer = Trainer.from_argparse_args(
+            args,
+            callbacks=[train_callback(args)],
+        )
 
     if trainer.global_rank == 0:
         for n in model.state_dict():

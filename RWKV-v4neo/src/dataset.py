@@ -57,13 +57,13 @@ class MyDataset(Dataset):
         elif args.data_type == "numpy":
             self.data = np.load(args.data_file).astype("int")
             self.vocab_size = args.vocab_size
-            rank_zero_info("Current vocab size =", self.vocab_size, "(make sure it's correct)")
+            rank_zero_info(f"Current vocab size = {self.vocab_size} (make sure it's correct)")
             self.data_size = len(self.data)
             rank_zero_info(f"Data has {self.data_size} tokens.")
         elif args.data_type == "uint16":
             self.data = np.fromfile(args.data_file, dtype=np.uint16).astype("int32").reshape(-1, args.my_sample_len)
             self.vocab_size = args.vocab_size
-            rank_zero_info("Current vocab size =", self.vocab_size, "(make sure it's correct)")
+            rank_zero_info(f"Current vocab size = {self.vocab_size} (make sure it's correct)")
             self.data_size = self.data.shape[0]
             rank_zero_info(f"Data has {self.data_size} samples.")
         elif args.data_type == "wds_img":
@@ -94,7 +94,7 @@ class MyDataset(Dataset):
             for u in unique:
                 xxObj[xx] = u
                 xx += 1
-            with open(f"{args.proj_dir}/vocab.json", "w", encoding="utf-16le") as vocab_file:
+            with open(f"{args.proj_dir}/vocab.json", "w", encoding="utf-8") as vocab_file:
                 vocab_file.write(json.dumps(xxObj, ensure_ascii=False))
             self.data_size = len(self.data)
             rank_zero_info(f"Data has {self.data_size} tokens, {self.vocab_size} vocab size.")
